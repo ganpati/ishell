@@ -2,76 +2,141 @@
 package ishell
 
 import (
+	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
+	"time"
+	"unicode"
 
-	"github.com/flynn/go-shlex"
-	"gopkg.in/readline.v1"
+	"github.com/abiosoft/readline"
+	"github.com/fatih/color"
+	shlex "github.com/flynn-archive/go-shlex"
 )
 
 const (
-	defaultPrompt     = ">>> "
-	defaultNextPrompt = "... "
+	defaultPrompt      = ">>> "
+	defaultMultiPrompt = "... "
 )
 
+var (
+	errNoHandler          = errors.New("incorrect input, try 'help'")
+	errNoInterruptHandler = errors.New("no interrupt handler")
+)
+
+// Shell is an interactive cli shell.
 type Shell struct {
-	functions   map[string]CmdFunc
-	generic     CmdFunc
-	reader      *shellReader
-	writer      io.Writer
-	active      bool
-	activeMutex sync.RWMutex
-	ignoreCase  bool
-	haltChan    chan struct{}
-	historyFile string
+	rootCmd           *Cmd
+	generic           func(*Context)
+	interrupt         func(*Context, int, string)
+	interruptCount    int
+	eof               func(*Context)
+	reader            *shellReader
+	writer            io.Writer
+	active            bool
+	activeMutex       sync.RWMutex
+	ignoreCase        bool
+	customCompleter   bool
+	multiChoiceActive bool
+	haltChan          chan struct{}
+	historyFile       string
+	autoHelp          bool
+	rawArgs           []string
+	progressBar       ProgressBar
+	pager             string
+	pagerArgs         []string
+	contextValues
+	Actions
 }
 
 // New creates a new shell with default settings. Uses standard output and default prompt ">> ".
 func New() *Shell {
-	rl, err := readline.New(defaultPrompt)
+	return NewWithConfig(&readline.Config{Prompt: defaultPrompt})
+}
+
+// NewWithConfig creates a new shell with custom readline config.
+func NewWithConfig(conf *readline.Config) *Shell {
+	rl, err := readline.NewEx(conf)
 	if err != nil {
 		log.Println("Shell or operating system not supported.")
 		log.Fatal(err)
 	}
 	shell := &Shell{
-		functions: make(map[string]CmdFunc),
+		rootCmd: &Cmd{},
 		reader: &shellReader{
 			scanner:     rl,
-			prompt:      defaultPrompt,
-			multiPrompt: defaultNextPrompt,
+			prompt:      rl.Config.Prompt,
+			multiPrompt: defaultMultiPrompt,
 			showPrompt:  true,
-			buf:         bytes.NewBuffer(nil),
+			buf:         &bytes.Buffer{},
 			completer:   readline.NewPrefixCompleter(),
 		},
-		writer:   os.Stdout,
-		haltChan: make(chan struct{}),
+		writer:   conf.Stdout,
+		autoHelp: true,
 	}
+	shell.Actions = &shellActionsImpl{Shell: shell}
+	shell.progressBar = newProgressBar(shell)
 	addDefaultFuncs(shell)
 	return shell
 }
 
-// Start starts the shell. It reads inputs from standard input and calls registered functions
-// accordingly. This function blocks until the shell is stopped.
+// Start starts the shell but does not wait for it to stop.
 func (s *Shell) Start() {
-	s.start()
+	s.prepareRun()
+	go s.run()
 }
 
-func (s *Shell) start() {
+// Run starts the shell and waits for it to stop.
+func (s *Shell) Run() {
+	s.prepareRun()
+	s.run()
+}
+
+// Wait waits for the shell to stop.
+func (s *Shell) Wait() {
+	<-s.haltChan
+}
+
+func (s *Shell) stop() {
+	if !s.Active() {
+		return
+	}
+	s.activeMutex.Lock()
+	s.active = false
+	s.activeMutex.Unlock()
+	close(s.haltChan)
+}
+
+// Close stops the shell (if required) and closes the shell's input.
+// This should be called when done with reading inputs.
+// Unlike `Stop`, a closed shell cannot be restarted.
+func (s *Shell) Close() {
+	s.stop()
+	s.reader.scanner.Close()
+}
+
+func (s *Shell) prepareRun() {
 	if s.Active() {
 		return
+	}
+	if !s.customCompleter {
+		s.initCompleters()
 	}
 	s.activeMutex.Lock()
 	s.active = true
 	s.activeMutex.Unlock()
 
+	s.haltChan = make(chan struct{})
+}
+
+func (s *Shell) run() {
 shell:
 	for s.Active() {
 		var line []string
@@ -87,34 +152,37 @@ shell:
 		case <-s.haltChan:
 			continue shell
 		}
-		if err == io.EOF {
-			fmt.Println("EOF")
-			break
-		} else if err != nil {
-			s.Println("Error:", err)
-			break
-		}
 
-		if len(line) == 0 {
+		if err == io.EOF {
+			if s.eof == nil {
+				fmt.Println("EOF")
+				break
+			}
+			if err := handleEOF(s); err != nil {
+				s.Println("Error:", err)
+				continue
+			}
+		} else if err != nil && err != readline.ErrInterrupt {
+			s.Println("Error:", err)
 			continue
 		}
 
-		err = handleInput(s, line)
-		if err1, ok := err.(shellError); ok && err != nil {
-			switch err1.level {
-			case LevelWarn:
-				s.Println("Warning:", err)
-				continue shell
-			case LevelStop:
-				s.Println(err)
-				break shell
-			case LevelExit:
-				s.Println(err)
-				os.Exit(1)
-			case LevelPanic:
-				panic(err)
+		if err == readline.ErrInterrupt {
+			// interrupt received
+			err = handleInterrupt(s, line)
+		} else {
+			// reset interrupt counter
+			s.interruptCount = 0
+
+			// normal flow
+			if len(line) == 0 {
+				// no input line
+				continue
 			}
-		} else if !ok && err != nil {
+
+			err = handleInput(s, line)
+		}
+		if err != nil {
 			s.Println("Error:", err)
 		}
 	}
@@ -127,6 +195,11 @@ func (s *Shell) Active() bool {
 	return s.active
 }
 
+// Process runs shell using args in a non-interactive mode.
+func (s *Shell) Process(args ...string) error {
+	return handleInput(s, args)
+}
+
 func handleInput(s *Shell, line []string) error {
 	handled, err := s.handleCommand(line)
 	if handled || err != nil {
@@ -137,65 +210,57 @@ func handleInput(s *Shell, line []string) error {
 	if s.generic == nil {
 		return errNoHandler
 	}
-	output, err := s.generic(line...)
-	if err != nil {
-		return err
+	c := newContext(s, nil, line)
+	s.generic(c)
+	return c.err
+}
+
+func handleInterrupt(s *Shell, line []string) error {
+	if s.interrupt == nil {
+		return errNoInterruptHandler
 	}
-	if output != "" {
-		s.Println(output)
-	}
-	return nil
+	c := newContext(s, nil, line)
+	s.interruptCount++
+	s.interrupt(c, s.interruptCount, strings.Join(line, " "))
+	return c.err
+}
+
+func handleEOF(s *Shell) error {
+	c := newContext(s, nil, nil)
+	s.eof(c)
+	return c.err
 }
 
 func (s *Shell) handleCommand(str []string) (bool, error) {
-	//	str := strings.SplitN(line, " ", 2)
-	cmd := str[0]
 	if s.ignoreCase {
-		cmd = strings.ToLower(cmd)
+		for i := range str {
+			str[i] = strings.ToLower(str[i])
+		}
 	}
-	if _, ok := s.functions[cmd]; !ok {
+	cmd, args := s.rootCmd.FindCmd(str)
+	if cmd == nil {
 		return false, nil
 	}
-	output, err := s.functions[cmd](str[1:]...)
-	if err != nil {
-		return true, err
+	// trigger help if func is not registered or auto help is true
+	if cmd.Func == nil || (s.autoHelp && len(args) == 1 && args[0] == "help") {
+		s.Println(cmd.HelpText())
+		return true, nil
 	}
-	if output != "" {
-		s.Println(output)
-	}
-	return true, nil
-}
-
-// Stop stops the shell. This will stop the shell from auto reading inputs and calling
-// registered functions. A stopped shell is only inactive but totally functional.
-// Its functions can still be called.
-func (s *Shell) Stop() {
-	s.reader.scanner.Close()
-	if !s.Active() {
-		return
-	}
-	s.activeMutex.Lock()
-	s.active = false
-	s.activeMutex.Unlock()
-	go func() {
-		s.haltChan <- struct{}{}
-	}()
-}
-
-// ReadLine reads a line from standard input.
-func (s *Shell) ReadLine() string {
-	line, _ := s.readLine()
-	return line
+	c := newContext(s, cmd, args)
+	cmd.Func(c)
+	return true, c.err
 }
 
 func (s *Shell) readLine() (line string, err error) {
 	consumer := make(chan lineString)
-	s.reader.readLine(consumer)
+	defer close(consumer)
+	go s.reader.readLine(consumer)
 	ls := <-consumer
 	return ls.line, ls.err
 }
 
 func (s *Shell) read() ([]string, error) {
+	s.rawArgs = nil
 	heredoc := false
 	eof := ""
 	// heredoc multiline
@@ -213,6 +278,8 @@ func (s *Shell) read() ([]string, error) {
 		}
 		return strings.HasSuffix(strings.TrimSpace(line), "\\")
 	})
+
+	s.rawArgs = strings.Fields(lines)
 
 	if heredoc {
 		s := strings.SplitN(lines, "<<", 2)
@@ -236,15 +303,8 @@ func (s *Shell) read() ([]string, error) {
 	return args, err
 }
 
-// ReadMultiLinesFunc reads multiple lines from standard input. It passes each read line to
-// f and stops reading when f returns false.
-func (s *Shell) ReadMultiLinesFunc(f func(string) bool) string {
-	lines, _ := s.readMultiLinesFunc(f)
-	return lines
-}
-
 func (s *Shell) readMultiLinesFunc(f func(string) bool) (string, error) {
-	lines := bytes.NewBufferString("")
+	var lines bytes.Buffer
 	currentLine := 0
 	var err error
 	for {
@@ -254,11 +314,11 @@ func (s *Shell) readMultiLinesFunc(f func(string) bool) (string, error) {
 		}
 		var line string
 		line, err = s.readLine()
-		fmt.Fprint(lines, line)
+		fmt.Fprint(&lines, line)
 		if !f(line) || err != nil {
 			break
 		}
-		fmt.Fprintln(lines)
+		fmt.Fprintln(&lines)
 		currentLine++
 	}
 	if currentLine > 0 {
@@ -269,114 +329,81 @@ func (s *Shell) readMultiLinesFunc(f func(string) bool) (string, error) {
 	return lines.String(), err
 }
 
-// ReadMultiLines reads multiple lines from standard input. It stops reading when terminator
-// is encountered at the end of the line. It returns the lines read including terminator.
-// For more control, use ReadMultiLinesFunc.
-func (s *Shell) ReadMultiLines(terminator string) string {
-	return s.ReadMultiLinesFunc(func(line string) bool {
-		if strings.HasSuffix(strings.TrimSpace(line), terminator) {
-			return false
-		}
-		return true
-	})
+func (s *Shell) initCompleters() {
+	s.setCompleter(iCompleter{cmd: s.rootCmd, disabled: func() bool { return s.multiChoiceActive }})
 }
 
-// ReadPassword reads password from standard input without echoing the characters.
-// If mask is true, each character will be represented with asterisks '*'. Note that
-// this only works as expected when the standard input is a terminal.
-func (s *Shell) ReadPassword() string {
-	return s.reader.readPassword()
+func (s *Shell) setCompleter(completer readline.AutoCompleter) {
+	config := s.reader.scanner.Config.Clone()
+	config.AutoComplete = completer
+	s.reader.scanner.SetConfig(config)
 }
 
-// Println prints to output and ends with newline character.
-func (s *Shell) Println(val ...interface{}) {
-	s.reader.buf.Truncate(0)
-	fmt.Fprintln(s.writer, val...)
+// CustomCompleter allows use of custom implementation of readline.Autocompleter.
+func (s *Shell) CustomCompleter(completer readline.AutoCompleter) {
+	s.customCompleter = true
+	s.setCompleter(completer)
 }
 
-// Print prints to output.
-func (s *Shell) Print(val ...interface{}) {
-	s.reader.buf.Truncate(0)
-	fmt.Fprint(s.reader.buf, val...)
-	fmt.Fprint(s.writer, val...)
+// AddCmd adds a new command handler.
+// This only adds top level commands.
+func (s *Shell) AddCmd(cmd *Cmd) {
+	s.rootCmd.AddCmd(cmd)
 }
 
-// Register registers a function for command. It overwrites existing function, if any.
-func (s *Shell) Register(command string, function CmdFunc) {
-	s.functions[command] = function
-
-	// readline library does not provide a better way
-	// yet than to regenerate the AutoComplete
-	// TODO modify when available
-	var pcItems []readline.PrefixCompleterInterface
-	for word, _ := range s.functions {
-		pcItems = append(pcItems, readline.PcItem(word))
-	}
-
-	var err error
-	// close current scanner and rebuild it with
-	// command in autocomplete
-	s.reader.scanner.Close()
-	config := s.reader.scanner.Config
-	config.AutoComplete = readline.NewPrefixCompleter(pcItems...)
-	s.reader.scanner, err = readline.NewEx(config)
-	if err != nil {
-		log.Fatal(err)
-	}
+// DeleteCmd deletes a top level command.
+func (s *Shell) DeleteCmd(name string) {
+	s.rootCmd.DeleteCmd(name)
 }
 
-// Unregister unregisters a function for a command
-func (s *Shell) Unregister(command string) {
-	delete(s.functions, command)
-}
-
-// RegisterGeneric registers a generic function for all inputs.
+// NotFound adds a generic function for all inputs.
 // It is called if the shell input could not be handled by any of the
-// registered functions. Unlike Register, the entire line is passed as
-// first argument to CmdFunc.
-func (s *Shell) RegisterGeneric(function CmdFunc) {
-	s.generic = function
+// added commands.
+func (s *Shell) NotFound(f func(*Context)) {
+	s.generic = f
 }
 
-// SetPrompt sets the prompt string. The string to be displayed before the cursor.
-func (s *Shell) SetPrompt(prompt string) {
-	s.reader.prompt = prompt
-	s.reader.scanner.SetPrompt(s.reader.rlPrompt())
+// AutoHelp sets if ishell should trigger help message if
+// a command's arg is "help". Defaults to true.
+//
+// This can be set to false for more control on how help is
+// displayed.
+func (s *Shell) AutoHelp(enable bool) {
+	s.autoHelp = enable
 }
 
-// SetMultiPrompt sets the prompt string used for multiple lines. The string to be displayed before
-// the cursor; starting from the second line of input.
-func (s *Shell) SetMultiPrompt(prompt string) {
-	s.reader.multiPrompt = prompt
+// Interrupt adds a function to handle keyboard interrupt (Ctrl-c).
+// count is the number of consecutive times that Ctrl-c has been pressed.
+// i.e. any input apart from Ctrl-c resets count to 0.
+func (s *Shell) Interrupt(f func(c *Context, count int, input string)) {
+	s.interrupt = f
 }
 
-// ShowPrompt sets whether prompt should show when requesting input for ReadLine and ReadPassword.
-// Defaults to true.
-func (s *Shell) ShowPrompt(show bool) {
-	s.reader.showPrompt = show
-	s.reader.scanner.SetPrompt(s.reader.rlPrompt())
+// EOF adds a function to handle End of File input (Ctrl-d).
+// This overrides the default behaviour which terminates the shell.
+func (s *Shell) EOF(f func(c *Context)) {
+	s.eof = f
 }
 
 // SetHistoryPath sets where readlines history file location. Use an empty
 // string to disable history file. It is empty by default.
-func (s *Shell) SetHistoryPath(path string) error {
-	var err error
-
+func (s *Shell) SetHistoryPath(path string) {
 	// Using scanner.SetHistoryPath doesn't initialize things properly and
 	// history file is never written. Simpler to just create a new readline
 	// Instance.
-	s.reader.scanner.Close()
-	config := s.reader.scanner.Config
+	config := s.reader.scanner.Config.Clone()
 	config.HistoryFile = path
-	s.reader.scanner, err = readline.NewEx(config)
-	return err
+	s.reader.scanner, _ = readline.NewEx(config)
 }
 
-// SetHomeHistoryPath is a convenience method that sets the history path with a
-// $HOME prepended path.
+// SetHomeHistoryPath is a convenience method that sets the history path
+// in user's home directory.
 func (s *Shell) SetHomeHistoryPath(path string) {
 	home := os.Getenv("HOME")
-	abspath := fmt.Sprintf("%s/%s", home, path)
+	if runtime.GOOS == "windows" {
+		home = os.Getenv("USERPROFILE")
+	}
+	abspath := filepath.Join(home, path)
 	s.SetHistoryPath(abspath)
 }
 
@@ -385,42 +412,272 @@ func (s *Shell) SetOut(writer io.Writer) {
 	s.writer = writer
 }
 
-// PrintCommands prints a space separated list of registered commands to the shell.
-func (s *Shell) PrintCommands() {
-	out := strings.Join(s.Commands(), " ")
-	if out != "" {
-		s.Println("Commands:")
-		s.Println(out)
-	}
+// SetPager sets the pager and its arguments for paged output
+func (s *Shell) SetPager(pager string, args []string) {
+	s.pager = pager
+	s.pagerArgs = args
 }
 
-// Commands returns a sorted list of all registered commands.
-func (s *Shell) Commands() []string {
-	var commands []string
-	for command := range s.functions {
-		commands = append(commands, command)
+func initSelected(init []int, max int) []int {
+	selectedMap := make(map[int]bool)
+	for _, i := range init {
+		if i < max {
+			selectedMap[i] = true
+		}
 	}
-	sort.Strings(commands)
-	return commands
+	selected := make([]int, len(selectedMap))
+	i := 0
+	for k := range selectedMap {
+		selected[i] = k
+		i++
+	}
+	return selected
+}
+
+func toggle(selected []int, cur int) []int {
+	for i, s := range selected {
+		if s == cur {
+			return append(selected[:i], selected[i+1:]...)
+		}
+	}
+	return append(selected, cur)
+}
+
+func (s *Shell) multiChoice(options []string, text string, init []int, multiResults bool) []int {
+	s.multiChoiceActive = true
+	defer func() { s.multiChoiceActive = false }()
+
+	conf := s.reader.scanner.Config.Clone()
+
+	conf.DisableAutoSaveHistory = true
+
+	conf.FuncFilterInputRune = func(r rune) (rune, bool) {
+		switch r {
+		case 16:
+			return -1, true
+		case 14:
+			return -2, true
+		case 32:
+			return -3, true
+
+		}
+		return r, true
+	}
+
+	var selected []int
+	if multiResults {
+		selected = initSelected(init, len(options))
+	}
+
+	s.ShowPrompt(false)
+	defer s.ShowPrompt(true)
+
+	// TODO this may not work on windows.
+	s.Print("\033[?25l")
+	defer s.Print("\033[?25h")
+
+	cur := 0
+	if len(selected) > 0 {
+		cur = selected[len(selected)-1]
+	}
+
+	fd := int(os.Stdout.Fd())
+	_, maxRows, err := readline.GetSize(fd)
+	if err != nil {
+		return nil
+	}
+
+	// move cursor to the top
+	// TODO it happens on every update, however, some trash appears in history without this line
+	s.Print("\033[0;0H")
+
+	offset := fd
+
+	update := func() {
+		strs := buildOptionsStrings(options, selected, cur)
+		if len(strs) > maxRows-1 {
+			strs = strs[offset : maxRows+offset-1]
+		}
+		s.Print("\033[0;0H")
+		// clear from the cursor to the end of the screen
+		s.Print("\033[0J")
+		s.Println(text)
+		s.Print(strings.Join(strs, "\n"))
+	}
+	var lastKey rune
+	refresh := make(chan struct{}, 1)
+	listener := func(line []rune, pos int, key rune) (newline []rune, newPos int, ok bool) {
+		lastKey = key
+		if key == -2 {
+			cur++
+			if cur >= maxRows+offset-1 {
+				offset++
+			}
+			if cur >= len(options) {
+				offset = fd
+				cur = 0
+			}
+		} else if key == -1 {
+			cur--
+			if cur < offset {
+				offset--
+			}
+			if cur < 0 {
+				if len(options) > maxRows-1 {
+					offset = len(options) - maxRows + 1
+				} else {
+					offset = fd
+				}
+				cur = len(options) - 1
+			}
+		} else if key == -3 {
+			if multiResults {
+				selected = toggle(selected, cur)
+			}
+		}
+		refresh <- struct{}{}
+		return
+	}
+	conf.Listener = readline.FuncListener(listener)
+	oldconf := s.reader.scanner.SetConfig(conf)
+
+	stop := make(chan struct{})
+	defer func() {
+		stop <- struct{}{}
+		s.Println()
+	}()
+	t := time.NewTicker(time.Millisecond * 200)
+	defer t.Stop()
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-refresh:
+				update()
+			case <-t.C:
+				_, rows, _ := readline.GetSize(fd)
+				if maxRows != rows {
+					maxRows = rows
+					update()
+				}
+			}
+		}
+	}()
+	s.ReadLine()
+
+	s.reader.scanner.SetConfig(oldconf)
+
+	// only handles Ctrl-c for now
+	// this can be broaden later
+	switch lastKey {
+	// Ctrl-c
+	case 3:
+		return []int{-1}
+	}
+	if multiResults {
+		return selected
+	}
+	return []int{cur}
+}
+
+func buildOptionsStrings(options []string, selected []int, index int) []string {
+	var strs []string
+	symbol := " ❯"
+	if runtime.GOOS == "windows" {
+		symbol = " >"
+	}
+	for i, opt := range options {
+		mark := "⬡ "
+		if selected == nil {
+			mark = " "
+		}
+		for _, s := range selected {
+			if s == i {
+				mark = "⬢ "
+			}
+		}
+		if i == index {
+			cyan := color.New(color.FgCyan).Add(color.Bold).SprintFunc()
+			strs = append(strs, cyan(symbol+mark+opt))
+		} else {
+			strs = append(strs, "  "+mark+opt)
+		}
+	}
+	return strs
 }
 
 // IgnoreCase specifies whether commands should not be case sensitive.
 // Defaults to false i.e. commands are case sensitive.
-// If true, commands must be registered in lower cases. e.g. shell.Register("cmd", ...)
+// If true, commands must be registered in lower cases.
 func (s *Shell) IgnoreCase(ignore bool) {
 	s.ignoreCase = ignore
 }
 
-// ClearScreen clears the screen. Same behaviour as running 'clear' in unix terminal or 'cls' in windows cmd.
-func (s *Shell) ClearScreen() error {
-	return clearScreen(s)
+// ProgressBar returns the progress bar for the shell.
+func (s *Shell) ProgressBar() ProgressBar {
+	return s.progressBar
 }
 
-func clearScreen(s *Shell) error {
-	cmd := exec.Command("clear")
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/C", "cls")
+func newContext(s *Shell, cmd *Cmd, args []string) *Context {
+	if cmd == nil {
+		cmd = &Cmd{}
 	}
-	cmd.Stdout = s.writer
-	return cmd.Run()
+	return &Context{
+		Actions:     s.Actions,
+		progressBar: copyShellProgressBar(s),
+		Args:        args,
+		RawArgs:     s.rawArgs,
+		Cmd:         *cmd,
+		contextValues: func() contextValues {
+			values := contextValues{}
+			for k := range s.contextValues {
+				values[k] = s.contextValues[k]
+			}
+			return values
+		}(),
+	}
+}
+
+func copyShellProgressBar(s *Shell) ProgressBar {
+	sp := s.progressBar.(*progressBarImpl)
+	p := newProgressBar(s)
+	p.Indeterminate(sp.indeterminate)
+	p.Display(sp.display)
+	p.Prefix(sp.prefix)
+	p.Suffix(sp.suffix)
+	p.Final(sp.final)
+	p.Interval(sp.interval)
+	return p
+}
+
+func getPosition() (int, int, error) {
+	fd := int(os.Stdout.Fd())
+	state, err := readline.MakeRaw(fd)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer readline.Restore(fd, state)
+	fmt.Printf("\033[6n")
+	var out string
+	reader := bufio.NewReader(os.Stdin)
+	if err != nil {
+		return 0, 0, err
+	}
+	for {
+		b, err := reader.ReadByte()
+		if err != nil || b == 'R' {
+			break
+		}
+		if unicode.IsPrint(rune(b)) {
+			out += string(b)
+		}
+	}
+	var row, col int
+	_, err = fmt.Sscanf(out, "[%d;%d", &row, &col)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return col, row, nil
 }
